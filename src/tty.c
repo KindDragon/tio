@@ -21,7 +21,14 @@
 
 #if defined(__linux__)
 #include <linux/serial.h>
+#elif defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOBSD.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/serial/IOSerialKeys.h>
+#include <IOKit/usb/IOUSBLib.h>
 #endif
+
 #include "config.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -1817,6 +1824,156 @@ GList *tty_search_for_serial_devices(void)
     closedir(dir);
 
     return device_list;
+}
+
+#elif defined(__APPLE__)
+
+char *getPropertyString(io_object_t device, CFStringRef property) {
+    CFStringRef valueRef = (CFStringRef)IORegistryEntryCreateCFProperty(
+        device, property, kCFAllocatorDefault, 0);
+    if (valueRef) {
+        const char *value =
+            CFStringGetCStringPtr(valueRef, kCFStringEncodingUTF8);
+        char *result = strdup(value); // Copy to C string and return
+        CFRelease(valueRef);
+        return result;
+    }
+    return NULL;
+}
+
+char *getDeviceLocation(io_object_t device) {
+    io_string_t location;
+    if (IORegistryEntryGetLocationInPlane(device, kIOServicePlane, location) ==
+        KERN_SUCCESS) {
+        return strdup(location);
+    }
+    return strdup("Unknown");
+}
+
+GList *tty_search_for_serial_devices(void) {
+    CFMutableDictionaryRef matchingDict =
+        IOServiceMatching(kIOSerialBSDServiceValue);
+    io_iterator_t iter;
+    kern_return_t kernResult =
+        IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iter);
+    if (kernResult != KERN_SUCCESS) {
+        printf("IOServiceGetMatchingServices failed: %d\n", kernResult);
+        return NULL;
+    }
+
+    printf("Device                         Port Location    TID  productName "
+           "vendorName\n");
+    printf("----------------------------- --------------- ---------------- "
+           "--------------------------\n");
+
+    io_object_t device;
+    while ((device = IOIteratorNext(iter))) {
+        char *devicePath = getPropertyString(device, CFSTR(kIODialinDeviceKey));
+
+        io_object_t usbDevice;
+        kernResult =
+            IORegistryEntryGetParentEntry(device, kIOServicePlane, &usbDevice);
+        while (kernResult == KERN_SUCCESS &&
+               !IOObjectConformsTo(usbDevice, "IOUSBDevice")) {
+            // CFStringRef className = IOObjectCopyClass(usbDevice);
+            // printf("className: %s\n",
+            //        CFStringGetCStringPtr(className, kCFStringEncodingUTF8));
+            io_object_t oldUsbDevice = usbDevice;
+            kernResult = IORegistryEntryGetParentEntry(
+                usbDevice, kIOServicePlane, &usbDevice);
+            IOObjectRelease(oldUsbDevice);
+        }
+
+        char *locationID = NULL; // unique numeric ID for USB port
+        char *tid = NULL;
+        char *productName = NULL;
+        char *vendorName = NULL;
+        if (kernResult == KERN_SUCCESS) {
+            locationID = getDeviceLocation(usbDevice);
+            unsigned long hash2 = djb2_hash((const unsigned char *)locationID);
+            tid = base62_encode(hash2);
+            // "USB Product Name" = "CP2102N USB to UART Bridge Controller"
+            productName = getPropertyString(usbDevice, CFSTR("USB Product Name"));
+            // "USB Vendor Name" = "Silicon Labs"
+            vendorName = getPropertyString(usbDevice, CFSTR("USB Vendor Name"));
+        }
+        IOObjectRelease(usbDevice);
+
+        if (devicePath) {
+            printf("%-35s %-15s %-3s '%-16s' '%-16s'\n", devicePath,
+                   locationID ? locationID : "Unknown", tid ? tid : "",
+                   productName ? productName : "Unknown",
+                   vendorName ? vendorName : "Unknown");
+
+            free(devicePath);
+        }
+        if (locationID)
+            free(locationID);
+        if (tid)
+            free(tid);
+        if (productName)
+            free(productName);
+        if (vendorName)
+            free(vendorName);
+    }
+
+    IOObjectRelease(iter);
+    /*io_object_t modemService;
+    while ((modemService = IOIteratorNext(iter))) {
+        CFStringRef bsdPath = (CFStringRef)IORegistryEntryCreateCFProperty(
+            modemService, CFSTR(kIODialinDeviceKey), kCFAllocatorDefault, 0);
+        if (bsdPath) {
+            printf("Device path: %s\n",
+                   CFStringGetCStringPtr(bsdPath, kCFStringEncodingUTF8));
+            CFRelease(bsdPath);
+        }
+
+        io_registry_entry_t parent;
+        kernResult = IORegistryEntryGetParentEntry(modemService,
+                                                   kIOServicePlane, &parent);
+        while (kernResult == KERN_SUCCESS) {
+            CFStringRef className = IOObjectCopyClass(parent);
+            // printf("className: %s\n",
+            //        CFStringGetCStringPtr(className, kCFStringEncodingUTF8));
+            if (CFStringCompare(className, CFSTR("IOUSBHostInterface"), 0) ==
+                kCFCompareEqualTo) {
+                    CFStringRef productName =
+                        (CFStringRef)IORegistryEntryCreateCFProperty(
+                            parent, CFSTR("USB Product Name"),
+                            kCFAllocatorDefault, 0);
+                    if (productName) {
+                        printf("USB Product Name: %s\n",
+                               CFStringGetCStringPtr(productName,
+                                                     kCFStringEncodingUTF8));
+                        CFRelease(productName);
+                    }
+                    CFStringRef vendorName =
+                        (CFStringRef)IORegistryEntryCreateCFProperty(
+                            parent, CFSTR("USB Vendor Name"),
+                            kCFAllocatorDefault, 0);
+                    if (vendorName) {
+                        printf("USB Vendor Name: %s\n",
+                               CFStringGetCStringPtr(vendorName,
+                                                     kCFStringEncodingUTF8));
+                        CFRelease(vendorName);
+                    }
+                    CFRelease(className);
+                    break;
+            }
+            CFRelease(className);
+
+            io_registry_entry_t oldParent = parent;
+            kernResult =
+                IORegistryEntryGetParentEntry(parent, kIOServicePlane, &parent);
+            IOObjectRelease(oldParent);
+        }
+
+        printf("\n");
+        IOObjectRelease(modemService);
+    }
+
+    IOObjectRelease(iter);*/
+    return NULL;
 }
 
 #else
